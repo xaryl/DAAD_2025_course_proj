@@ -1,0 +1,332 @@
+---
+title: "Preprocessing Standard"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+    highlights: pygments
+    number_sections: yes
+    self_contained: yes
+    theme: default
+    toc: yes
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+
+## Install packages
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+install.packages(c("here", "tidyverse", "harmony", "Matrix", "remotes"))
+remotes::install_github("satijalab/seurat", "seurat5", quiet = TRUE)
+```
+
+
+## Import packages
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+library(here)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(Seurat)
+library(readr)
+library(purrr)
+library(harmony)
+library(Matrix)
+```
+
+## Download the data
+Run in bash
+
+mkdir data
+
+cd data
+
+wget https://ftp.ncbi.nlm.nih.gov/geo/series/GSE116nnn/GSE116256/suppl/GSE116256_RAW.tar -O GSE116256_RAW.tar
+
+tar -xvf GSE116256_RAW.tar
+
+rm GSE116256_RAW.tar
+
+
+## Set the path to the data folder
+```{r}
+data_path = here("./data/")
+```
+
+
+## Get count matrices
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+# Function to read counts
+read_counts <- function(file_path) {
+    counts <- read_tsv(file_path)
+    counts <- as.data.frame(counts)
+    
+    # Moves gene names to row names
+    genes <- counts$Gene
+    counts <- counts[,-1]
+    rownames(counts) <- genes
+    
+    return(as.matrix(counts))
+}
+
+# Read all count matrices
+count_files <- list.files(data_path, pattern = "*.dem.txt.gz", full.names = TRUE)[1:41]
+samples <- map_chr(count_files, basename)
+samples <- str_replace(samples, "(GSM[0-9]+_.+).dem.txt.gz", "\\1")
+names(count_files) <- samples
+counts <- map(count_files, read_counts)
+```
+
+
+## Get metadata
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+# Function to read metadata
+read_meta <- function(file_path) {
+    meta <- read_tsv(file_path)
+    meta <- as.data.frame(meta)
+    
+    # Moves gene names to row names
+    cells <- meta$Cell
+    meta <- meta[,-1]
+    rownames(meta) <- cells
+    
+    return(meta)
+}
+
+# Read all metadata
+meta_files <- list.files(data_path, pattern = "*.anno.txt.gz", full.names = TRUE)[1:41]
+meta_names <- map_chr(meta_files, basename)
+meta_names <- str_replace(meta_names, "(GSM[0-9]+_.+).anno.txt.gz", "\\1")
+names(meta_files) <- meta_names
+meta <- map(meta_files, read_meta)
+```
+
+
+## Create Seurat object
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+objs <- map2(counts, meta, 
+             ~CreateSeuratObject(counts = as(.x, "sparseMatrix"),
+                                 meta.data = .y))
+merged_seurat <- reduce(objs, function(x, y) {merge(x, y)})
+```
+
+
+## Free up memory
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+rm(counts, meta, objs)
+```
+
+
+## Add custom metadata
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+merged_seurat$Temp <- rownames(merged_seurat@meta.data)
+merged_seurat@meta.data <- tidyr::separate(merged_seurat@meta.data, 
+                                    col = Temp, 
+                                    into = c("Temp2", "Barcode"), 
+                                    sep = "_")
+merged_seurat@meta.data <- tidyr::separate(merged_seurat@meta.data, 
+                                           col = Temp2, 
+                                           into = c("Patient_id", "Days_from_diagnosis"), 
+                                           sep = "-")
+merged_seurat@meta.data$Days_from_diagnosis[merged_seurat@meta.data$Days_from_diagnosis %in% c("34p", "34p38n")] <- NA
+merged_seurat@meta.data$Days_from_diagnosis <- gsub("^D", "", merged_seurat@meta.data$Days_from_diagnosis)
+merged_seurat@meta.data$Days_from_diagnosis <- as.integer(merged_seurat@meta.data$Days_from_diagnosis)
+
+# List of sample groups
+sample_groups <- list(
+    control = c("BM1", "BM2", "BM3", "BM4", "BM5-34p", "BM5-34p38n"),
+    pre_chemo = c("AML1012-D0", "AML210A-D0", "AML419A-D0", "AML916-D0", "AML921A-D0",
+                  "AML314-D0", "AML371-D0", "AML475-D0", "AML722B-D0", "AML870-D0", "AML997-D0",
+                  "AML329-D0", "AML420B-D0", "AML556-D0", "AML328-D0", "AML707B-D0"),
+    post_chemo = c("AML314-D31", "AML371-D34", "AML475-D29", "AML722B-D49", "AML870-D14",
+                   "AML997-D35", "AML329-D20", "AML329-D37", "AML420B-D14", "AML420B-D35",
+                   "AML556-D15", "AML556-D31", "AML328-D29", "AML328-D113", "AML328-D171",
+                   "AML707B-D18", "AML707B-D41", "AML707B-D97", "AML707B-D113")
+)
+
+# Function to get group
+get_group <- function(sample) {
+    for (group in names(sample_groups)) {
+        if (sample %in% sample_groups[[group]]) return(group)
+    }
+}
+
+# Add condition column
+merged_seurat$Condition <- map_chr(merged_seurat$orig.ident, get_group)
+
+# List of additional information about patients
+sample_info <- list(
+  BM1 = c(Gender = "M", Age = 52),
+  BM2 = c(Gender = "M", Age = 21),
+  BM3 = c(Gender = "M", Age = 56),
+  BM4 = c(Gender = "M", Age = 23),
+  BM5 = c(Gender = "M", Age = 45),
+  AML1012 = c(Gender = "F", Age = 32),
+  AML210A = c(Gender = "M", Age = 67),
+  AML419A = c(Gender = "F", Age = 54),
+  AML916 = c(Gender = "F", Age = 57),
+  AML921A = c(Gender = "M", Age = 42),
+  AML314 = c(Gender = "M", Age = 54), 
+  AML371 = c(Gender = "M", Age = 51), 
+  AML475 = c(Gender = "M", Age = 70), 
+  AML722B = c(Gender = "F", Age = 52),
+  AML870 = c(Gender = "M", Age = 32), 
+  AML997 = c(Gender = "M", Age = 62), 
+  AML329 = c(Gender = "F", Age = 73), 
+  AML420B = c(Gender = "M", Age = 58),
+  AML556 = c(Gender = "M", Age = 70), 
+  AML328 = c(Gender = "F", Age = 74), 
+  AML707B = c(Gender = "M", Age = 26)
+)
+
+# Init columns Gender and Age
+merged_seurat@meta.data$Gender <- NA
+merged_seurat@meta.data$Age <- NA
+
+# For loop to fill columns Gender and Age
+for (sample_name in unique(merged_seurat@meta.data$Patient_id)) {
+    gender <- sample_info[[sample_name]]["Gender"]
+    age <- sample_info[[sample_name]]["Age"]
+
+    # Fill columns Gender and Age
+    merged_seurat@meta.data[merged_seurat@meta.data$Patient_id == sample_name, "Gender"] <- gender
+    merged_seurat@meta.data[merged_seurat@meta.data$Patient_id == sample_name, "Age"] <- age
+}
+```
+
+So, we have a Seurat object with 41 samples. In metadata, we have a columns `Condition`, `Patient_id`, `Days_from_diagnosis` and `CellType`. 
+
+`Condition` is a factor with three levels: `control`, `pre_chemo` and `post_chemo`. In `control` group we have 6 samples that starts with `BM`. In `pre_chemo` group we have 16 samples that ends with `-D0`. In `post_chemo` group we have 19 samples that ends with `-DXX` where `XX` is the number of days after chemotherapy.
+
+`Patient_id` is a factor that represents the patient id (like `AML1012` or `BM1`). 
+
+`Days_from_diagnosis` is a factor that represents the days from diagnosis (like `0` or `113`) or `NA` for control.
+
+`CellType` is a factor with 22 levels: `GMP`, `GMP-like`, `Prog-like`, `ProMono-like`, `HSC-like`, `cDC-like`, `Mono-like`, `Mono`, `Prog`, `cDC`, `HSC`, `ProMono`, `earlyEry`, `CTL`, `T`, `Plasma`, `ProB`, `NK`, `B`, `lateEry`, `pDC` or `NA`. These types predicted by the authors of the study.
+
+Also we have two additional columns `Gender` and `Age` that we filled with information about patients.
+
+
+## Check cell counts by groups
+```{r}
+table(merged_seurat$Condition)
+```
+
+
+## Filter cells by mitochondrial genes
+```{r warning=FALSE}
+merged_seurat$percent.mt <- PercentageFeatureSet(merged_seurat, pattern="^MT-")
+VlnPlot(merged_seurat, features = c("nCount_RNA","nFeature_RNA","percent.mt"), group.by = "Condition")
+m_seurat <- subset(merged_seurat, subset = nCount_RNA < 50000 & nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 10)
+VlnPlot(m_seurat, features = c("nCount_RNA","nFeature_RNA","percent.mt"), group.by = "Condition")
+```
+
+
+## Visualize feature-feature relationships
+```{r results="hide", fig.width = 12, fig.height = 12}
+plot1 <- FeatureScatter(m_seurat, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(m_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+gridExtra::grid.arrange(plot1, plot2, nrow = 2)
+```
+
+
+## Free up memory
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+rm(merged_seurat)
+```
+
+
+## Normalize data
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+m_seurat <- m_seurat %>% 
+    NormalizeData(normalization.method = "LogNormalize", scale.factor = 10000) %>%
+    FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+    ScaleData()
+```
+
+
+## Run PCA
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+m_seurat <- RunPCA(m_seurat, npcs = 50)
+```
+
+
+## Create Elbow plot to determine number of PCs
+```{r}
+ElbowPlot(m_seurat)
+```
+
+Let's say that the elbow plot shows that the optimal number of PCs is 20.
+
+
+## Run UMAP before Harmony
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+m_seurat <- RunUMAP(m_seurat, dims = 1:20)
+```
+
+
+## Plot UMAP for different groupings
+```{r results="hide", fig.width = 12, fig.height = 28}
+p1 <- DimPlot(m_seurat, reduction = "umap", group.by = "Condition")
+p2 <- DimPlot(m_seurat, reduction = "umap", group.by = "Patient_id")
+p3 <- DimPlot(m_seurat, reduction = "umap", group.by = "CellType")
+gridExtra::grid.arrange(p1, p2, p3, nrow = 3)
+```
+
+Looks good, but we need to correct for batch effects with Harmony.
+
+
+## Run Harmony
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+harmonized_seurat <- RunHarmony(m_seurat,
+                                group.by.vars = c("Condition"),
+                                reduction = "pca", 
+                                reduction.save = "harmony")
+```
+
+
+## Free up memory
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+rm(m_seurat)
+```
+
+
+## Run UMAP and clusterization after Harmony  
+```{r echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+harmonized_seurat <- harmonized_seurat %>% 
+    RunUMAP(reduction = "harmony", dims = 1:20) %>%
+    FindNeighbors(reduction = "harmony", dims = 1:20) %>%
+    FindClusters(resolution = 0.6)
+```
+
+
+## Plot UMAP for different groupings after Harmony
+```{r results="hide", fig.width = 12, fig.height = 28}
+p4 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "Condition")
+p5 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "Patient_id")
+p6 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "CellType")
+gridExtra::grid.arrange(p4, p5, p6, nrow = 3)
+```
+
+
+## Before and after pairwise comparison
+```{r results="hide", fig.width = 12, fig.height = 50}
+gridExtra::grid.arrange(p1, p4, p2, p5, p3, p6, nrow = 6)
+```
+
+
+## Plot UMAP with our clusters and original clusters
+```{r results="hide", fig.width = 12, fig.height = 18}
+p7 <- DimPlot(harmonized_seurat, reduction = "umap")
+gridExtra::grid.arrange(p6, p7, nrow = 2)
+```
+
+
+## Save Seurat object
+```{r results="hide"}
+saveRDS(harmonized_seurat, "prepared_seurat_obj_standard.RDS")
+```
